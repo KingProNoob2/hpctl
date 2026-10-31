@@ -1,0 +1,11 @@
+[Unit]
+Description=Apply HP GPU clock floors (dGPU + iGPU)
+After=multi-user.target nvidia-persistenced.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'm=$(cat /etc/hpctl.gpumin 2>/dev/null || echo 600); /usr/local/bin/hpctl gpu "$m"; i=$(cat /etc/hpctl.igpumin 2>/dev/null || echo 700); /usr/local/bin/hpctl igpu "$i"'
+
+[Install]
+WantedBy=multi-user.target

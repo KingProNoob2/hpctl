@@ -1,0 +1,118 @@
+#!/bin/bash
+# hpctl - HP Spectre control: performance profile, fan, EC and raw HP-WMI access
+#   hpctl profile [0-4]      get / set the EC power profile (HP WMI 0x4C)
+#   hpctl igpu [min]         iGPU frequency floor / limits
+#   hpctl fan                fan tach + EC fan registers
+#   hpctl info               everything readable through HP WMI
+#   hpctl ec <off> [val]     read/write an EC RAM byte (e.g. 0xb7 = GPU TGP)
+#   hpctl wmi <comd> <cmdt> <dszi> [d0 d1 d2 d3]
+LIB=/usr/local/lib/hpctl
+CONF=/etc/hpctl.profile
+[ "$(id -u)" -eq 0 ] || { echo "hpctl: root required" >&2; exit 1; }
+modprobe ec_sys 2>/dev/null
+IO=/sys/kernel/debug/ec/ec0/io
+
+wmi() { # comd cmdt dszi [d0..d3]
+	local comd=$1 cmdt=$2 dszi=$3; shift 3
+	local d0=${1:-0} d1=${2:-0} d2=${3:-0} d3=${4:-0}
+	dmesg -C >/dev/null 2>&1
+	[ -f "$LIB/hpstps.ko" ] || make -C "$LIB" >/dev/null 2>&1
+	insmod "$LIB/hpstps.ko" comd="$comd" cmd="$cmdt" dszi="$dszi" \
+	       d0="$d0" d1="$d1" d2="$d2" d3="$d3" sizeclass=3 2>/dev/null
+	rmmod hpstps 2>/dev/null
+	sleep 0.15
+	dmesg | grep hpstps | tail -1 | sed 's/.*hpstps: //'
+}
+data_of() { sed -n 's/.* data=//p'; }
+
+ec_get() { xxd -s "$1" -l "${2:-1}" -p "$IO"; }
+fan_rpm() {
+	if [ ! -r "$IO" ]; then echo 0; return; fi
+	local a=$((16#$(ec_get 0xb2))) b=$((16#$(ec_get 0xb3)))
+	local per=$(( a | (b << 8) ))
+	[ "$per" -gt 0 ] && echo $(( 480000 / per )) || echo 0
+}
+show_profile() {
+	local p; p=$(wmi 1 0x4C 4 | data_of | awk '{print $1}')
+	[ -z "$p" ] && p="?"
+	printf "profile=%s (WTPS)  HPCM=0x%s  DGTP=0x%s  CMAX=0x%s  fan=%s rpm\n" \
+		"$p" "$(ec_get 0x95)" "$(ec_get 0xb7)" "$(ec_get 0xbb)" "$(fan_rpm)"
+}
+case "$1" in
+profile|p)
+	if [ -n "$2" ]; then
+		case "$2" in [0-4]) ;; *) echo "hpctl: profile must be 0-4" >&2; exit 1;; gpu)
+	# gpu [min] - set a clock floor (4K desktop stutters when the dGPU idles at P8/300MHz)
+	if [ -n "$2" ]; then
+		max=$(nvidia-smi --query-gpu=clocks.max.gr --format=csv,noheader,nounits | tr -d ' ')
+		nvidia-smi -lgc "$2","$max" >/dev/null 2>&1
+		echo "$2" > /etc/hpctl.gpumin
+	fi
+	nvidia-smi --query-gpu=name,pstate,clocks.gr,clocks.max.gr,power.draw,temperature.gpu --format=csv,noheader
+	;;
+esac
+		wmi 2 0x4C 4 "$2" >/dev/null
+		sleep 1
+		show_profile
+		echo "$2" > "$CONF"
+	else
+		show_profile
+	fi
+	;;
+fan)
+	printf "tach period=0x%04x  fan=%s rpm\n" \
+		$(( $(ec_get 0xb2 | sed 's/^/0x/') )) "$(fan_rpm)"
+	printf "EC 0xB2..0xB3 = %s %s   SFAN(0xF4)=%s  SFHK(0xE6)=%s\n" \
+		"$(ec_get 0xb2)" "$(ec_get 0xb3)" "$(ec_get 0xf4)" "$(ec_get 0xe6)"
+	;;
+info)
+	echo "== EC / platform =="
+	printf "  profile WTPS = %s\n" "$(wmi 1 0x4C 4 | data_of | awk '{print $1}')"
+	printf "  HPCM  = 0x%s   DMST = 0x%s\n" "$(ec_get 0x95)" "$(ec_get 0xc0)"
+	printf "  DGTP  = 0x%s (%d)   CMAX = 0x%s   CLOW = 0x%s   DPPC = 0x%s\n" \
+		"$(ec_get 0xb7)" "$((16#$(ec_get 0xb7)))" "$(ec_get 0xbb)" "$(ec_get 0xba)" "$(ec_get 0xc1)"
+	printf "  fan   = %s rpm (tach %s/%s)\n" "$(fan_rpm)" "$(ec_get 0xb2)" "$(ec_get 0xb3)"
+	echo "== HP WMI reads =="
+	for spec in "0x07:GBIF:4" "0x08:GBBT:4" "0x09:GHKS:4" "0x0A:GHKF:4" "0x0D:GFRC:4" \
+	            "0x0F:GSAS:4" "0x10:GWSD:8" "0x1D:GSDC:4" "0x1E:GBUS:4" "0x1F:GBCC:4" \
+	            "0x2A:GPES:4" "0x2B:GBCO:4" "0x2C:GTCS:4" "0x36:GPST:128" "0x37:GBCT:128" \
+	            "0x38:GBST:4" "0x3E:GPPS:4" "0x44:GBMF:4" "0x4D:GPCS:4"; do
+		I=${spec%%:*}; rest=${spec#*:}; N=${rest%%:*}; S=${rest##*:}
+		printf "  %-5s %-5s %s\n" "$I" "$N" "$(wmi 1 $I $S | data_of | cut -c1-48)"
+	done
+	;;
+ec)
+	if [ -n "$3" ]; then
+		printf "\\x$(printf %02x "$3")" | dd of="$IO" bs=1 seek=$(($2)) count=1 conv=notrunc 2>/dev/null
+		printf "EC[0x%02x] = %s (was)\n" "$2" "$(ec_get $2)"
+	else
+		printf "EC[0x%02x] = 0x%s\n" "$2" "$(ec_get $2)"
+	fi
+	;;
+wmi)
+	shift; wmi "$@"
+	;;
+gpu)
+	# gpu [min] - set a clock floor (4K desktop stutters when the dGPU idles at P8/300MHz)
+	if [ -n "$2" ]; then
+		max=$(nvidia-smi --query-gpu=clocks.max.gr --format=csv,noheader,nounits | tr -d ' ')
+		nvidia-smi -lgc "$2","$max" >/dev/null 2>&1
+		echo "$2" > /etc/hpctl.gpumin
+	fi
+	nvidia-smi --query-gpu=name,pstate,clocks.gr,clocks.max.gr,power.draw,temperature.gpu --format=csv,noheader
+	;;
+igpu)
+	# igpu [min] - iGPU frequency floor (350 MHz idle -> ramps for each 4K composite)
+	if [ -n "$2" ]; then
+		echo "$2" > /sys/class/drm/card1/gt_min_freq_mhz 2>/dev/null
+		echo "$2" > /etc/hpctl.igpumin
+	fi
+	printf "iGPU min=%s MHz  max=%s MHz  cur=%s MHz\n" \
+		"$(cat /sys/class/drm/card1/gt_min_freq_mhz 2>/dev/null)" \
+		"$(cat /sys/class/drm/card1/gt_max_freq_mhz 2>/dev/null)" \
+		"$(cat /sys/class/drm/card1/gt/gt0/rps_cur_freq_mhz 2>/dev/null)"
+	;;
+*)
+	sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+	;;
+esac

@@ -1,0 +1,11 @@
+[Unit]
+Description=Apply the HP performance profile (hpctl)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'p=$(cat /etc/hpctl.profile 2>/dev/null || echo 1); /usr/local/bin/hpctl profile "$p"'
+
+[Install]
+WantedBy=multi-user.target
